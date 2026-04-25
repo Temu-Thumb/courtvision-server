@@ -1,120 +1,100 @@
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-import sqlite3
-from datetime import datetime, timedelta
 import uvicorn
+from datetime import datetime, timedelta
+import sqlite3
+import hashlib
+import uuid
 
-app = FastAPI(title="CourtVision Premium License Server")
+app = FastAPI()
 
-ADMIN_SECRET = "MySuperSecretPassword2026CourtVision12345!"   # ← Must match your Railway variable
+# ←←← CHANGE THIS TO A STRONG SECRET AND SET THE SAME IN RAILWAY VARIABLES ←←←
+ADMIN_SECRET = "MySuperSecretPassword2026CourtVision12345!"
+
+# SQLite database
+conn = sqlite3.connect("licenses.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute('''CREATE TABLE IF NOT EXISTS keys (
+    key TEXT PRIMARY KEY,
+    expiration TEXT,
+    locked_mac TEXT,
+    hwid_resets INTEGER DEFAULT 0,
+    is_lifetime INTEGER DEFAULT 0
+)''')
+conn.commit()
 
 class ValidateRequest(BaseModel):
     key: str
     mac: str
 
-class ResetRequest(BaseModel):
+class CreateKeyRequest(BaseModel):
+    key_name: str
+    days: int
+
+class ResetHwidRequest(BaseModel):
     key: str
     mac: str
 
-class CreateKeyRequest(BaseModel):
-    key: str
-    days: int = 365
-    is_lifetime: bool = False
-
-def init_db():
-    conn = sqlite3.connect("licenses.db")
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS keys (
-        key TEXT PRIMARY KEY,
-        expiration TEXT,
-        locked_mac TEXT,
-        hwid_resets INTEGER DEFAULT 0,
-        is_lifetime INTEGER DEFAULT 0
-    )''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
 @app.post("/validate")
-async def validate(request: ValidateRequest):
-    conn = sqlite3.connect("licenses.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM keys WHERE key = ?", (request.key,))
-    row = c.fetchone()
-    conn.close()
-
+async def validate(req: ValidateRequest):
+    cursor.execute("SELECT expiration, locked_mac, is_lifetime FROM keys WHERE key = ?", (req.key,))
+    row = cursor.fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="Invalid key")
-
-    key, expiration, locked_mac, resets, is_lifetime = row
-
+        raise HTTPException(status_code=400, detail="Invalid or expired key")
+    
+    expiration_str, locked_mac, is_lifetime = row
+    if locked_mac and locked_mac != req.mac:
+        raise HTTPException(status_code=403, detail="Key locked to another device")
+    
     try:
-        exp_date = datetime.fromisoformat(expiration.replace("Z", "+00:00"))
-        if exp_date < datetime.now():
-            return {"valid": False, "message": "Key expired"}
+        exp = datetime.fromisoformat(expiration_str.replace("Z", "+00:00"))
+        if exp < datetime.now():
+            raise HTTPException(status_code=400, detail="Key expired")
     except:
         pass
 
-    if not locked_mac or locked_mac == request.mac:
-        return {"valid": True, "expiration": expiration}
+    return {"valid": True, "expiration": expiration_str, "is_lifetime": bool(is_lifetime)}
+
+@app.post("/create_key")
+async def create_key(req: CreateKeyRequest, x_admin_secret: str = Header(None)):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    key = req.key_name.strip()
+    days = req.days
+
+    if days == 0:  # lifetime
+        expiration = (datetime.now() + timedelta(days=36525)).isoformat()
+        is_lifetime = 1
     else:
-        return {"valid": False, "message": "HWID mismatch"}
+        expiration = (datetime.now() + timedelta(days=days)).isoformat()
+        is_lifetime = 0
+
+    cursor.execute("INSERT OR REPLACE INTO keys (key, expiration, locked_mac, hwid_resets, is_lifetime) VALUES (?, ?, '', 0, ?)", 
+                   (key, expiration, is_lifetime))
+    conn.commit()
+
+    return {"status": "Key created", "key": key, "expiration": expiration}
 
 @app.post("/reset_hwid")
-async def reset_hwid(request: ResetRequest):
-    conn = sqlite3.connect("licenses.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM keys WHERE key = ?", (request.key,))
-    row = c.fetchone()
+async def reset_hwid(req: ResetHwidRequest):
+    cursor.execute("SELECT expiration, hwid_resets, is_lifetime FROM keys WHERE key = ?", (req.key,))
+    row = cursor.fetchone()
     if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Invalid key")
+        raise HTTPException(status_code=400, detail="Key not found")
+    
+    expiration_str, resets, is_lifetime = row
+    new_resets = resets + 1
 
-    key, expiration, locked_mac, resets, is_lifetime = row
-    resets = int(resets) + 1
+    if is_lifetime and new_resets >= 3:
+        expiration = (datetime.now() + timedelta(days=30)).isoformat()
+    else:
+        expiration = (datetime.now() + timedelta(days=364)).isoformat()
 
-    try:
-        current_exp = datetime.fromisoformat(expiration.replace("Z", "+00:00"))
-        new_exp = current_exp - timedelta(days=1)
-        if is_lifetime and resets >= 3:
-            new_exp = datetime.now() + timedelta(days=30)
-            is_lifetime = 0
-    except:
-        new_exp = datetime.now() + timedelta(days=364)
-
-    new_exp_str = new_exp.isoformat()
-
-    c.execute("UPDATE keys SET locked_mac = ?, hwid_resets = ?, expiration = ? WHERE key = ?",
-              (request.mac, resets, new_exp_str, request.key))
+    cursor.execute("UPDATE keys SET locked_mac = ?, hwid_resets = ? WHERE key = ?", (req.mac, new_resets, req.key))
     conn.commit()
-    conn.close()
-    return {"success": True, "new_expiration": new_exp_str}
 
-# ================== NEW ENDPOINTS ==================
-@app.post("/delete_key")
-async def delete_key(req: CreateKeyRequest, x_admin_secret: str = Header(None)):
-    if x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    conn = sqlite3.connect("licenses.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM keys WHERE key = ?", (req.key,))
-    conn.commit()
-    conn.close()
-    return {"status": "Key deleted successfully"}
-
-@app.post("/update_expiration")
-async def update_expiration(req: CreateKeyRequest, x_admin_secret: str = Header(None)):
-    if x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    conn = sqlite3.connect("licenses.db")
-    c = conn.cursor()
-    exp = datetime.now() + timedelta(days=req.days if not req.is_lifetime else 365)
-    c.execute("UPDATE keys SET expiration = ? WHERE key = ?", (exp.isoformat(), req.key))
-    conn.commit()
-    conn.close()
-    return {"status": "Expiration updated", "new_expiration": exp.isoformat()}
-# ==================================================
+    return {"status": "HWID reset successful", "new_expiration": expiration}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
