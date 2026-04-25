@@ -6,7 +6,7 @@ import uvicorn
 
 app = FastAPI(title="CourtVision Premium License Server")
 
-ADMIN_SECRET = "MySuperSecretPassword2026CourtVision12345!"   # ← Change this later if you want
+ADMIN_SECRET = "MySuperSecretPassword2026CourtVision12345!"   # ← Must match your Railway variable
 
 class ValidateRequest(BaseModel):
     key: str
@@ -91,19 +91,30 @@ async def reset_hwid(request: ResetRequest):
     conn.close()
     return {"success": True, "new_expiration": new_exp_str}
 
-@app.post("/create_key")
-async def create_key(req: CreateKeyRequest, x_admin_secret: str = Header(None)):
+# ================== NEW ENDPOINTS ==================
+@app.post("/delete_key")
+async def delete_key(req: CreateKeyRequest, x_admin_secret: str = Header(None)):
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Unauthorized")
+    conn = sqlite3.connect("licenses.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM keys WHERE key = ?", (req.key,))
+    conn.commit()
+    conn.close()
+    return {"status": "Key deleted successfully"}
 
+@app.post("/update_expiration")
+async def update_expiration(req: CreateKeyRequest, x_admin_secret: str = Header(None)):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
     conn = sqlite3.connect("licenses.db")
     c = conn.cursor()
     exp = datetime.now() + timedelta(days=req.days if not req.is_lifetime else 365)
-    c.execute("INSERT OR REPLACE INTO keys (key, expiration, locked_mac, hwid_resets, is_lifetime) VALUES (?, ?, '', 0, ?)",
-              (req.key, exp.isoformat(), 1 if req.is_lifetime else 0))
+    c.execute("UPDATE keys SET expiration = ? WHERE key = ?", (exp.isoformat(), req.key))
     conn.commit()
     conn.close()
-    return {"status": "Key created", "key": req.key, "expiration": exp.isoformat()}
+    return {"status": "Expiration updated", "new_expiration": exp.isoformat()}
+# ==================================================
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
