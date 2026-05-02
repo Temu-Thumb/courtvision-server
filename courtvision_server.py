@@ -21,6 +21,13 @@ class CreateKeyRequest(BaseModel):
     days: int = 365
     is_lifetime: bool = False
 
+class EditKeyRequest(BaseModel):
+    key: str
+    new_expiration: str = None   # ISO format or "LIFETIME"
+
+class DeleteKeyRequest(BaseModel):
+    key: str
+
 def init_db():
     conn = sqlite3.connect("licenses.db")
     c = conn.cursor()
@@ -36,8 +43,29 @@ def init_db():
 
 init_db()
 
+@app.get("/keys")
+async def list_keys(x_admin_secret: str = Header(None)):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    conn = sqlite3.connect("licenses.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM keys")
+    rows = c.fetchall()
+    conn.close()
+    keys = []
+    for row in rows:
+        keys.append({
+            "key": row[0],
+            "expiration": row[1],
+            "locked_mac": row[2],
+            "hwid_resets": row[3],
+            "is_lifetime": bool(row[4])
+        })
+    return {"keys": keys}
+
 @app.post("/validate")
 async def validate(request: ValidateRequest):
+    # (your original validate code - unchanged)
     conn = sqlite3.connect("licenses.db")
     c = conn.cursor()
     c.execute("SELECT * FROM keys WHERE key = ?", (request.key,))
@@ -63,6 +91,7 @@ async def validate(request: ValidateRequest):
 
 @app.post("/reset_hwid")
 async def reset_hwid(request: ResetRequest):
+    # (your original reset code - unchanged)
     conn = sqlite3.connect("licenses.db")
     c = conn.cursor()
     c.execute("SELECT * FROM keys WHERE key = ?", (request.key,))
@@ -93,6 +122,30 @@ async def reset_hwid(request: ResetRequest):
     conn.close()
 
     return {"success": True, "new_expiration": new_exp_str}
+
+@app.post("/edit_key")
+async def edit_key(req: EditKeyRequest, x_admin_secret: str = Header(None)):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    conn = sqlite3.connect("licenses.db")
+    c = conn.cursor()
+    c.execute("UPDATE keys SET expiration = ? WHERE key = ?", (req.new_expiration, req.key))
+    conn.commit()
+    conn.close()
+    return {"status": "Key updated", "key": req.key}
+
+@app.post("/delete_key")
+async def delete_key(req: DeleteKeyRequest, x_admin_secret: str = Header(None)):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    conn = sqlite3.connect("licenses.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM keys WHERE key = ?", (req.key,))
+    conn.commit()
+    conn.close()
+    return {"status": "Key deleted", "key": req.key}
 
 @app.post("/create_key")
 async def create_key(req: CreateKeyRequest, x_admin_secret: str = Header(None)):
